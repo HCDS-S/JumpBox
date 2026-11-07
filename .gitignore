@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.log
+jumpbox_debug.log
+.dbg/
+*.zip
