@@ -17,14 +17,16 @@ JumpBox —— 屏幕上的复制暂存盒
 import hashlib
 import html
 import os
+import shutil
 import sys
 import tempfile
 import time
 import traceback
 import uuid
 
-from PyQt5.QtCore import (QAbstractNativeEventFilter, QEvent, QPoint, QPointF,
-                          QRectF, QSize, Qt, QTimer, pyqtSignal as Signal)
+from PyQt5.QtCore import (QAbstractNativeEventFilter, QEvent, QMimeData, QPoint,
+                          QPointF, QRectF, QSize, Qt, QTimer, QUrl,
+                          pyqtSignal as Signal)
 from PyQt5.QtGui import (QColor, QFont, QIcon, QImage, QPainter,
                          QPainterPath, QPixmap)
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
@@ -42,7 +44,9 @@ IMG_MAX_EDGE = 2560 # 超大图缩到该边长再存
 DEBOUNCE_MS = 120   # 剪贴板抖动合并窗口
 SIG_GUARD = True    # 回环守卫用内容签名比对(不再依赖时间窗)
 
-# 设计约定:纯内存工具——不读写任何文件、无历史记录,进程结束即全部清空
+# 设计约定:纯内存工具——除"文件粘贴模式"的临时文件外不读写任何文件、
+# 无历史记录,进程结束即全部清空
+STAGING_DIR = os.path.join(tempfile.gettempdir(), "JumpBoxPaste")
 DEBUG = bool(os.environ.get("JUMPBOX_DEBUG"))  # 调试:普通窗口(UIA 可见)+ 行为日志
 
 STYLES = """
@@ -330,6 +334,12 @@ def _rounded_pixmap(pm: QPixmap, radius: int) -> QPixmap:
     return out
 
 
+def _sanitize_name(s: str) -> str:
+    for ch in '\\/:*?"<>|\n\r\t':
+        s = s.replace(ch, "")
+    return (s.strip() or "内容")[:16]
+
+
 class FullPopup(QFrame):
     """"显全"气泡:圆角卡片 + 投影,标题栏显示类型/字数/时间;失活或 ✕ 关闭。"""
 
@@ -430,6 +440,7 @@ class ClipBox(QWidget):
         self._bubble = None      # "显全"气泡(同一时间最多一个)
         self._selected_ids = []  # 点选:按点击顺序累积
         self._selected_set = set()
+        shutil.rmtree(STAGING_DIR, ignore_errors=True)  # 清掉崩溃残留的粘贴临时文件
         self._last_deact_id = None
         self._last_deact_t = 0.0
         self._last_write = None  # 自己刚写回剪贴板的内容签名(防回环)
@@ -757,22 +768,17 @@ class ClipBox(QWidget):
             row.flash_copied()
 
     def _copy_all(self):
-        """全选:按存入时间顺序,把所有文本合并放回剪贴板(一次 Ctrl+V 全部贴出)。"""
-        seen, texts = set(), []
+        """全选:按存入时间顺序把所有条目放回剪贴板(纯文本合并;含图片走文件模式)。"""
+        seen, items = set(), []
         for it in sorted(self.items, key=lambda x: x["ts"]):
-            if it["kind"] != "text" or it.get("text") is None:
-                continue
             if it.get("sig") in seen:
                 continue
             seen.add(it.get("sig"))
-            texts.append(it["text"])
-        if not texts:
-            self._flash_count("没有可合并的文本")
+            items.append(it)
+        if not items:
+            self._flash_count("盒子是空的")
             return
-        joined = "\n".join(texts)
-        self._last_write = text_sig(joined)      # 防回环:合并结果不当新内容回收
-        QApplication.clipboard().setText(joined)
-        self._flash_count(f"✓ 已合并 {len(texts)} 条文本")
+        self._apply_selection_to_clipboard(items)
 
     def _on_row_clicked(self, item_id: str):
         """点选累积:点过的条目带蓝框,剪贴板实时等于所选内容(按点击顺序)。"""
@@ -790,30 +796,65 @@ class ClipBox(QWidget):
                 row.set_selected(True)
         self._apply_selection_to_clipboard()
 
-    def _apply_selection_to_clipboard(self):
-        """当前选中内容 → 剪贴板(文本按点击顺序合并;图片仅单选时可取)。"""
-        items = [next((x for x in self.items if x["id"] == i), None)
-                 for i in self._selected_ids]
-        items = [it for it in items if it]
+    def _apply_selection_to_clipboard(self, items=None):
+        """点选/全选 → 剪贴板。
+
+        纯文本(单条或多条)= 合并文本;
+        含图片 = 文件模式:每条写成一个临时文件进"文件列表",
+        一次粘贴得到一组文件(资源管理器/微信/QQ/Word 均认)。
+        Windows 剪贴板一次只能承载一张位图,多图只能走文件。
+        """
+        if items is None:
+            items = [next((x for x in self.items if x["id"] == i), None)
+                     for i in self._selected_ids]
+            items = [it for it in items if it]
         if not items:
             return                          # 取消到空:剪贴板保持现状
-        texts = [it["text"] for it in items
-                 if it["kind"] == "text" and it.get("text") is not None]
-        n_img = sum(1 for it in items if it["kind"] == "image")
-        if not texts:                       # 只点了图片:取最后点的那张
-            img = next((it for it in reversed(items) if it["kind"] == "image"), None)
-            if img:
-                self._last_write = img.get("sig") or image_sig(img["image"])
-                QApplication.clipboard().setImage(img["image"])
+        texts = [it for it in items if it["kind"] == "text" and it.get("text")]
+        imgs = [it for it in items if it["kind"] == "image"]
+
+        if len(items) == 1:                 # 单条:保持直取(图片=位图,聊天直接贴)
+            it = items[0]
+            if it["kind"] == "text":
+                QApplication.clipboard().setText(it["text"])
+            else:
+                self._last_write = it.get("sig") or image_sig(it["image"])
+                QApplication.clipboard().setImage(it["image"])
             return
-        joined = "\n".join(texts)
-        self._last_write = text_sig(joined)
-        QApplication.clipboard().setText(joined)
-        if len(items) > 1:
-            msg = f"✓ 已合并 {len(texts)} 条文本"
-            if n_img:
-                msg += f"(图片 {n_img} 张不参与)"
-            self._flash_count(msg)
+
+        if not imgs:                        # 多条纯文本:按顺序合并
+            joined = "\n".join(it["text"] for it in texts)
+            self._last_write = text_sig(joined)
+            QApplication.clipboard().setText(joined)
+            self._flash_count(f"✓ 已合并 {len(texts)} 条文本")
+            return
+
+        # 含图片:文件模式
+        try:
+            shutil.rmtree(STAGING_DIR, ignore_errors=True)
+            os.makedirs(STAGING_DIR, exist_ok=True)
+            paths = []
+            for idx, it in enumerate(items, 1):
+                if it["kind"] == "text":
+                    fp = os.path.join(STAGING_DIR, f"{idx:02d}_文本_"
+                                      f"{_sanitize_name(text_preview(it['text']))}.txt")
+                    with open(fp, "w", encoding="utf-8") as f:
+                        f.write(it["text"])
+                else:
+                    fp = os.path.join(STAGING_DIR, f"{idx:02d}_图片_"
+                                      f"{_sanitize_name(it.get('preview') or '')}.png")
+                    if not it["image"].save(fp, "PNG"):
+                        raise OSError(fp)
+                paths.append(fp)
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+            self._last_write = text_sig(
+                "\n".join(QUrl.fromLocalFile(p).toString() for p in paths))
+            QApplication.clipboard().setMimeData(mime)
+            self._flash_count(f"✓ 已打包 {len(paths)} 个文件"
+                              f"(图片 {len(imgs)} 张),粘贴即得一组文件")
+        except OSError:
+            self._flash_count("文件模式失败:请改为逐条点击取回")
 
     def _cancel_selection(self):
         """取消:清掉点选高亮(剪贴板保持当前内容)。"""
@@ -826,6 +867,10 @@ class ClipBox(QWidget):
                 row.set_selected(False)
         self._selected_ids = []
         self._selected_set = set()
+
+    def _staging_clear(self):
+        """清掉文件粘贴模式的临时目录(进程退出时调用;剪贴板随之失效属正常)。"""
+        shutil.rmtree(STAGING_DIR, ignore_errors=True)
 
     def _flash_count(self, msg: str):
         self._count_lbl.setText(msg)
@@ -995,6 +1040,7 @@ def main():
         return
 
     box = ClipBox()
+    app.aboutToQuit.connect(box._staging_clear)   # 退出时清掉粘贴临时文件
     box.show_and_focus()
 
     # 第二实例/快捷方式再次点击 → 唤起已有盒子
